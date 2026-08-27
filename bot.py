@@ -69,11 +69,22 @@ def _require_env(name, fallback=""):
     val = os.environ.get(name, "").strip()
     return val if val else fallback
 
-TOKEN          = _require_env("BOT_TOKEN",           "")
-OWNER_ID       = int(_require_env("OWNER_ID",        "8753914631"))
-ADMIN_ID       = int(_require_env("ADMIN_ID",        "8753914631"))
-YOUR_USERNAME  = _require_env("YOUR_USERNAME",       "@OfficialDkSharma01")
-SAMBA_API_KEY  = _require_env("SAMBA_API_KEY",       "e4502644-72e1-41bb-96df-e13aa741a6f9")
+# IMPORTANT: put secrets in Render Environment Variables, never in source code.
+TOKEN = _require_env("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is required")
+
+def _env_int(name, default=0):
+    raw = _require_env(name, str(default))
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+
+OWNER_ID= "8753914631"
+ADMIN_ID= "8753914631"
+YOUR_USERNAME  = _require_env("YOUR_USERNAME", "@OfficialDkSharma01")
+SAMBA_API_KEY  = _require_env("SAMBA_API_KEY")
 
 REQUIRED_CHANNELS = ["@FriendsChatingZone1"]
 
@@ -3703,25 +3714,180 @@ def download_bot_callback(call):
         bot.answer_callback_query(call.id, "Download error.", show_alert=True)
 
 # =========================================================================
-# CLEANUP + GRACEFUL SHUTDOWN (Section 0.4, Section 4 item 64)
+# RUNTIME / RENDER WEB SERVICE COMPATIBILITY
 # =========================================================================
+# Render Web Services require a real HTTP listener on 0.0.0.0:$PORT.
+# The Telegram polling loop runs in a separate thread so the HTTP listener
+# is available immediately and remains available even when Telegram polling
+# temporarily fails.
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+SHUTDOWN_EVENT = threading.Event()
+HEALTH_SERVER = None
+POLLING_THREAD = None
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _respond(self, status=200, body=b"OK\n"):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            self._respond(200, b"OK - Telegram bot is running\n")
+        else:
+            self._respond(200, b"OK\n")
+
+    def do_HEAD(self):
+        self._respond(200, b"")
+
+    def log_message(self, fmt, *args):
+        # Keep Render logs clean; application logs are handled by logger.
+        return
+
+
+class _ReusableHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def start_health_server():
+    """Bind Render's PORT with retries and serve health checks."""
+    global HEALTH_SERVER
+    port_raw = os.environ.get("PORT", "10000").strip()
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 10000
+        logger.warning("Invalid PORT=%r; using 10000", port_raw)
+
+    last_error = None
+    for attempt in range(1, 11):
+        if SHUTDOWN_EVENT.is_set():
+            return
+        try:
+            HEALTH_SERVER = _ReusableHTTPServer(("0.0.0.0", port), _HealthHandler)
+            logger.info("Render HTTP health server listening on 0.0.0.0:%s", port)
+            HEALTH_SERVER.timeout = 1
+            while not SHUTDOWN_EVENT.is_set():
+                HEALTH_SERVER.handle_request()
+            return
+        except OSError as exc:
+            last_error = exc
+            logger.error("HTTP bind attempt %d/10 failed on port %s: %s", attempt, port, exc)
+            time.sleep(min(attempt, 5))
+        except Exception:
+            logger.exception("Health server crashed")
+            time.sleep(2)
+
+    raise RuntimeError(f"Could not bind Render HTTP port {port}: {last_error}")
+
+
+def polling_worker():
+    """Keep Telegram polling alive without restarting the whole Render process."""
+    backoff = 5
+    consecutive_failures = 0
+    while not SHUTDOWN_EVENT.is_set():
+        try:
+            logger.info(
+                "Starting Telegram polling (version %s, storage=%s)...",
+                PLATFORM_VERSION, STORAGE_STATE
+            )
+            bot.infinity_polling(
+                timeout=60,
+                long_polling_timeout=30,
+                skip_pending=True,
+                allowed_updates=None,
+            )
+            # A normal return is also treated as a recoverable disconnect.
+            if not SHUTDOWN_EVENT.is_set():
+                logger.warning("Telegram polling stopped; restarting polling loop.")
+                consecutive_failures += 1
+        except Exception as exc:
+            consecutive_failures += 1
+            logger.exception(
+                "Telegram polling error (failure #%d): %s",
+                consecutive_failures, exc
+            )
+            if consecutive_failures >= 10:
+                try:
+                    bot.send_message(
+                        OWNER_ID,
+                        stylish_text(
+                            f"⚠️ Telegram polling has failed {consecutive_failures} times."
+                        ),
+                    )
+                except Exception:
+                    pass
+                consecutive_failures = 0
+
+        if SHUTDOWN_EVENT.is_set():
+            break
+
+        # Do NOT os.execv() here. Self-exec can create a new HTTP listener,
+        # leave threads behind, or make Render lose the port during restart.
+        delay = min(backoff, 300)
+        logger.info("Polling retry in %ss", delay)
+        SHUTDOWN_EVENT.wait(delay)
+        backoff = min(backoff * 2, 300)
+
+        # Successful polling resets the backoff when the loop remains healthy.
+        if consecutive_failures == 0:
+            backoff = 5
+
+
 def cleanup():
+    """Stop child scripts, HTTP server and background workers cleanly."""
+    if SHUTDOWN_EVENT.is_set():
+        # Cleanup is intentionally idempotent.
+        pass
+    SHUTDOWN_EVENT.set()
+
     logger.warning("Shutting down — killing all child scripts...")
     for key, info in list(bot_scripts.items()):
-        try: kill_process_tree(info)
-        except Exception: pass
+        try:
+            kill_process_tree(info)
+        except Exception:
+            logger.exception("Failed cleaning child process %s", key)
     bot_scripts.clear()
+
+    global HEALTH_SERVER
+    if HEALTH_SERVER is not None:
+        try:
+            HEALTH_SERVER.server_close()
+        except Exception:
+            pass
+        HEALTH_SERVER = None
+
+    try:
+        if _lock_fp:
+            _lock_fp.close()
+    except Exception:
+        pass
+
     logger.warning("Cleanup done.")
+
 
 atexit.register(cleanup)
 
+
 def _sigterm_handler(signum, frame):
-    logger.warning("SIGTERM received — graceful shutdown.")
+    logger.warning("Signal %s received — graceful shutdown.", signum)
     cleanup()
-    try:
-        if _lock_fp: _lock_fp.close()
-    except Exception: pass
-    sys.exit(0)
+    raise SystemExit(0)
+
 
 signal.signal(signal.SIGTERM, _sigterm_handler)
 try:
@@ -3729,59 +3895,48 @@ try:
 except Exception:
     pass
 
-# =========================================================================
-# MAIN LOOP — exponential backoff (Section 4, item 59)
-# =========================================================================
-def run_bot():
-    backoff = 5
-    max_backoff = 300
-    consecutive_failures = 0
-    while True:
-        try:
-            logger.info(f"Starting polling (version {PLATFORM_VERSION}, storage={STORAGE_STATE})...")
-            bot.infinity_polling(timeout=60, long_polling_timeout=30)
-        except Exception as e:
-            consecutive_failures += 1
-            logger.error(f"Polling error: {e} (failure #{consecutive_failures})")
-            if consecutive_failures >= 10:
-                try:
-                    bot.send_message(OWNER_ID, stylish_text(
-                        f"⚠️ Bot in crash-loop — {consecutive_failures} consecutive failures. Last: {e}"))
-                except Exception: pass
-                consecutive_failures = 0
-            time.sleep(min(backoff, max_backoff))
-            backoff = min(backoff * 2, max_backoff)
-            # Section 0.4 fix: cleanup() BEFORE execv so children don't orphan
-            cleanup()
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except Exception as e:
-                logger.error(f"execv failed: {e}")
-                time.sleep(10)
-        else:
-            consecutive_failures = 0
-            backoff = 5
 
+def main():
+    """Render-safe process entry point."""
+    global POLLING_THREAD
 
-# Render Web Service health endpoint
-def start_health_server():
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK - Telegram bot is running")
-        def do_HEAD(self):
-            self.send_response(200)
-            self.end_headers()
-        def log_message(self, format, *args):
-            pass
-    port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"Health server listening on 0.0.0.0:{port}")
-    server.serve_forever()
+    # Bind the HTTP port FIRST. If binding fails, Render gets a clear fatal
+    # error instead of silently reporting 'No open ports detected'.
+    start_health_thread = threading.Thread(
+        target=start_health_server,
+        name="render-health-server",
+        daemon=False,
+    )
+    start_health_thread.start()
+
+    # Wait briefly for the server to bind before starting Telegram polling.
+    # This removes the startup race that can cause Render port detection to
+    # miss the listener on cold starts.
+    deadline = time.monotonic() + 15
+    while HEALTH_SERVER is None and start_health_thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+    if HEALTH_SERVER is None:
+        raise RuntimeError("Render HTTP health server did not start within 15 seconds")
+
+    POLLING_THREAD = threading.Thread(
+        target=polling_worker,
+        name="telegram-polling",
+        daemon=True,
+    )
+    POLLING_THREAD.start()
+    logger.info("Render Web Service startup complete.")
+
+    # Keep the main process alive while the health server is serving.
+    try:
+        while not SHUTDOWN_EVENT.wait(5):
+            if not start_health_thread.is_alive():
+                raise RuntimeError("Render HTTP health server stopped unexpectedly")
+    finally:
+        cleanup()
+        if start_health_thread.is_alive():
+            start_health_thread.join(timeout=3)
+
 
 if __name__ == "__main__":
-    threading.Thread(target=start_health_server, daemon=True).start()
-    run_bot()
+    main()
