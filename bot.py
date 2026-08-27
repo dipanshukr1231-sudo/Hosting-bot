@@ -81,22 +81,14 @@ def _env_int(name, default=0):
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer") from exc
 
-OWNER_ID       = _env_int("OWNER_ID", 8753914631)
-ADMIN_ID       = _env_int("ADMIN_ID", OWNER_ID)
-YOUR_USERNAME  = _require_env("YOUR_USERNAME", "@OfficialDkSharma01")
+OWNER_ID       = 8753914631
+ADMIN_ID       = 8753914631
+YOUR_USERNAME  = "@OfficialDkSharma01"
+OWNER_USERNAME = "@OfficialDkSharma01"
+UPDATE_GROUP_URL = "https://t.me/FriendsChatingZone1"
 SAMBA_API_KEY  = _require_env("SAMBA_API_KEY")
 
-# Public update/community group. This is used only for the Updates button;
-# it is NOT forced as a membership requirement, so a missing group permission
-# can never block normal bot startup or /start.
-UPDATE_GROUP_URL = _require_env("UPDATE_GROUP_URL", "https://t.me/FriendsChatingZone1")
-
-# Optional required channels can be configured in Render as a comma-separated
-# list. Leave empty to disable membership verification.
-_required_channels_raw = _require_env("REQUIRED_CHANNELS", "")
-REQUIRED_CHANNELS = [
-    item.strip() for item in _required_channels_raw.split(",") if item.strip()
-]
+REQUIRED_CHANNELS = ["@BrokenXworld"]
 
 BASE_DIR        = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.environ.get("UPLOAD_BOTS_DIR", os.path.join(BASE_DIR, "upload_bots"))
@@ -2452,7 +2444,7 @@ def create_control_buttons(script_owner_id, file_name, is_running=True):
 def create_main_menu_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
-        types.InlineKeyboardButton("📢 Updates Group", url=UPDATE_GROUP_URL),
+        types.InlineKeyboardButton("📢 Updates Channel", callback_data="updates_channel"),
         types.InlineKeyboardButton("🌏 Upload",          callback_data="upload"),
         types.InlineKeyboardButton("📁 My Files",        callback_data="check_files"),
         types.InlineKeyboardButton("⚡ Bot Speed",        callback_data="speed"),
@@ -2595,13 +2587,10 @@ def _logic_updates_channel(chat_id, user_id):
     if not check_subscription_and_continue(user_id, chat_id):
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("📢 Join Update Group", url=UPDATE_GROUP_URL))
-    bot.send_message(
-        chat_id,
-        stylish_text("📢 Official Update Group"),
-        reply_markup=markup,
-        disable_web_page_preview=True,
-    )
+    markup.add(types.InlineKeyboardButton("📢 Updates Group", url=UPDATE_GROUP_URL))
+    for ch in REQUIRED_CHANNELS:
+        markup.add(types.InlineKeyboardButton(ch, url=f"https://t.me/{ch.lstrip('@')}"))
+    bot.send_message(chat_id, stylish_text("📢 Our Updates:"), reply_markup=markup)
 
 def _logic_upload_file(chat_id, user_id):
     if not check_subscription_and_continue(user_id, chat_id):
