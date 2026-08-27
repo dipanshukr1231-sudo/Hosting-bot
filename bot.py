@@ -75,7 +75,7 @@ ADMIN_ID       = int(_require_env("ADMIN_ID",        "8753914631"))
 YOUR_USERNAME  = _require_env("YOUR_USERNAME",       "@OfficialDkSharma01")
 SAMBA_API_KEY  = _require_env("SAMBA_API_KEY",       "e4502644-72e1-41bb-96df-e13aa741a6f9")
 
-REQUIRED_CHANNELS = ["@BrokenXworld"]
+REQUIRED_CHANNELS = ["@FriendsChatingZone1"]
 
 BASE_DIR        = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.environ.get("UPLOAD_BOTS_DIR", os.path.join(BASE_DIR, "upload_bots"))
@@ -3206,6 +3206,7 @@ def cmd_find_user(message):
 # =========================================================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
+    global bot_locked
     if call.data.startswith("verify_channel_"):
         return  # handled by its own handler above
     user_id = call.from_user.id
@@ -3260,14 +3261,12 @@ def handle_callbacks(call):
         else: bot.answer_callback_query(call.id, "Admin only.", show_alert=True)
     elif data == "lock_bot":
         if user_id in admin_ids:
-            global bot_locked
             bot_locked = True
             bot.answer_callback_query(call.id, "Bot locked.")
             _logic_send_welcome(chat_id, user_id)
             audit_log(user_id, "lock", "on")
     elif data == "unlock_bot":
         if user_id in admin_ids:
-            global bot_locked
             bot_locked = False
             bot.answer_callback_query(call.id, "Bot unlocked.")
             _logic_send_welcome(chat_id, user_id)
