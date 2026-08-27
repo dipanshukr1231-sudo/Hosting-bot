@@ -81,12 +81,22 @@ def _env_int(name, default=0):
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer") from exc
 
-OWNER_ID= "8753914631"
-ADMIN_ID= "8753914631"
+OWNER_ID       = _env_int("OWNER_ID", 8753914631)
+ADMIN_ID       = _env_int("ADMIN_ID", OWNER_ID)
 YOUR_USERNAME  = _require_env("YOUR_USERNAME", "@OfficialDkSharma01")
 SAMBA_API_KEY  = _require_env("SAMBA_API_KEY")
 
-REQUIRED_CHANNELS = ["@FriendsChatingZone1"]
+# Public update/community group. This is used only for the Updates button;
+# it is NOT forced as a membership requirement, so a missing group permission
+# can never block normal bot startup or /start.
+UPDATE_GROUP_URL = _require_env("UPDATE_GROUP_URL", "https://t.me/FriendsChatingZone1")
+
+# Optional required channels can be configured in Render as a comma-separated
+# list. Leave empty to disable membership verification.
+_required_channels_raw = _require_env("REQUIRED_CHANNELS", "")
+REQUIRED_CHANNELS = [
+    item.strip() for item in _required_channels_raw.split(",") if item.strip()
+]
 
 BASE_DIR        = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.environ.get("UPLOAD_BOTS_DIR", os.path.join(BASE_DIR, "upload_bots"))
@@ -2442,7 +2452,7 @@ def create_control_buttons(script_owner_id, file_name, is_running=True):
 def create_main_menu_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
-        types.InlineKeyboardButton("📢 Updates Channel", callback_data="updates_channel"),
+        types.InlineKeyboardButton("📢 Updates Group", url=UPDATE_GROUP_URL),
         types.InlineKeyboardButton("🌏 Upload",          callback_data="upload"),
         types.InlineKeyboardButton("📁 My Files",        callback_data="check_files"),
         types.InlineKeyboardButton("⚡ Bot Speed",        callback_data="speed"),
@@ -2585,9 +2595,13 @@ def _logic_updates_channel(chat_id, user_id):
     if not check_subscription_and_continue(user_id, chat_id):
         return
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for ch in REQUIRED_CHANNELS:
-        markup.add(types.InlineKeyboardButton(ch, url=f"https://t.me/{ch.lstrip('@')}"))
-    bot.send_message(chat_id, stylish_text("📢 Our Channels:"), reply_markup=markup)
+    markup.add(types.InlineKeyboardButton("📢 Join Update Group", url=UPDATE_GROUP_URL))
+    bot.send_message(
+        chat_id,
+        stylish_text("📢 Official Update Group"),
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
 
 def _logic_upload_file(chat_id, user_id):
     if not check_subscription_and_continue(user_id, chat_id):
@@ -3722,19 +3736,22 @@ def download_bot_callback(call):
 # temporarily fails.
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 SHUTDOWN_EVENT = threading.Event()
 HEALTH_SERVER = None
 POLLING_THREAD = None
+WEBHOOK_MODE = False
+WEBHOOK_PATH = "/telegram-webhook"
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _respond(self, status=200, body=b"OK\n"):
+    def _respond(self, status=200, body=b"OK\n", content_type="text/plain; charset=utf-8"):
         try:
             self.send_response(status)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
@@ -3745,16 +3762,48 @@ class _HealthHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if self.path in ("/", "/health", "/healthz"):
+        path = urlparse(self.path).path
+        if path in ("/", "/health", "/healthz"):
             self._respond(200, b"OK - Telegram bot is running\n")
         else:
-            self._respond(200, b"OK\n")
+            self._respond(404, b"Not Found\n")
 
     def do_HEAD(self):
-        self._respond(200, b"")
+        path = urlparse(self.path).path
+        self._respond(200 if path in ("/", "/health", "/healthz") else 404, b"")
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != WEBHOOK_PATH:
+            self._respond(404, b"Not Found\n")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 5 * 1024 * 1024:
+                self._respond(400, b"Invalid request\n")
+                return
+
+            body = self.rfile.read(length)
+            update = types.Update.de_json(body.decode("utf-8"))
+            if update is None:
+                self._respond(400, b"Invalid Telegram update\n")
+                return
+
+            # Acknowledge quickly; process the update on a worker thread so
+            # Telegram does not have to wait for a handler/network operation.
+            self._respond(200, b"OK\n")
+            threading.Thread(
+                target=_process_webhook_update,
+                args=(update,),
+                daemon=True,
+                name="telegram-update",
+            ).start()
+        except Exception as exc:
+            logger.exception("Webhook request error: %s", exc)
+            self._respond(500, b"Webhook error\n")
 
     def log_message(self, fmt, *args):
-        # Keep Render logs clean; application logs are handled by logger.
         return
 
 
@@ -3763,15 +3812,21 @@ class _ReusableHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def _process_webhook_update(update):
+    try:
+        bot.process_new_updates([update])
+    except Exception:
+        logger.exception("Telegram update processing failed")
+
+
 def start_health_server():
-    """Bind Render's PORT with retries and serve health checks."""
+    """Bind Render's PORT and keep the HTTP service alive."""
     global HEALTH_SERVER
     port_raw = os.environ.get("PORT", "10000").strip()
     try:
         port = int(port_raw)
-    except ValueError:
-        port = 10000
-        logger.warning("Invalid PORT=%r; using 10000", port_raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid Render PORT: {port_raw!r}") from exc
 
     last_error = None
     for attempt in range(1, 11):
@@ -3779,7 +3834,7 @@ def start_health_server():
             return
         try:
             HEALTH_SERVER = _ReusableHTTPServer(("0.0.0.0", port), _HealthHandler)
-            logger.info("Render HTTP health server listening on 0.0.0.0:%s", port)
+            logger.info("Render HTTP server listening on 0.0.0.0:%s", port)
             HEALTH_SERVER.timeout = 1
             while not SHUTDOWN_EVENT.is_set():
                 HEALTH_SERVER.handle_request()
@@ -3787,75 +3842,69 @@ def start_health_server():
         except OSError as exc:
             last_error = exc
             logger.error("HTTP bind attempt %d/10 failed on port %s: %s", attempt, port, exc)
-            time.sleep(min(attempt, 5))
+            SHUTDOWN_EVENT.wait(min(attempt, 5))
         except Exception:
             logger.exception("Health server crashed")
-            time.sleep(2)
+            SHUTDOWN_EVENT.wait(2)
 
     raise RuntimeError(f"Could not bind Render HTTP port {port}: {last_error}")
 
 
-def polling_worker():
-    """Keep Telegram polling alive without restarting the whole Render process."""
-    backoff = 5
-    consecutive_failures = 0
-    while not SHUTDOWN_EVENT.is_set():
+def _get_webhook_url():
+    """Resolve a public HTTPS webhook URL on Render."""
+    explicit = os.environ.get("WEBHOOK_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit + WEBHOOK_PATH
+
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if render_url:
+        return render_url + WEBHOOK_PATH
+
+    return ""
+
+
+def start_telegram():
+    """Use webhook mode on Render; polling is only a local fallback."""
+    global WEBHOOK_MODE
+    webhook_url = _get_webhook_url()
+
+    if webhook_url:
+        WEBHOOK_MODE = True
         try:
-            logger.info(
-                "Starting Telegram polling (version %s, storage=%s)...",
-                PLATFORM_VERSION, STORAGE_STATE
-            )
-            bot.infinity_polling(
-                timeout=60,
-                long_polling_timeout=30,
-                skip_pending=True,
-                allowed_updates=None,
-            )
-            # A normal return is also treated as a recoverable disconnect.
-            if not SHUTDOWN_EVENT.is_set():
-                logger.warning("Telegram polling stopped; restarting polling loop.")
-                consecutive_failures += 1
-        except Exception as exc:
-            consecutive_failures += 1
-            logger.exception(
-                "Telegram polling error (failure #%d): %s",
-                consecutive_failures, exc
-            )
-            if consecutive_failures >= 10:
-                try:
-                    bot.send_message(
-                        OWNER_ID,
-                        stylish_text(
-                            f"⚠️ Telegram polling has failed {consecutive_failures} times."
-                        ),
-                    )
-                except Exception:
-                    pass
-                consecutive_failures = 0
+            # Setting a webhook switches Telegram away from getUpdates, so
+            # Render deployments do not fight with another polling instance.
+            bot.remove_webhook()
+            time.sleep(0.5)
+            bot.set_webhook(url=webhook_url)
+            info = bot.get_webhook_info()
+            logger.info("Telegram webhook enabled: %s", info.url)
+            logger.info("Telegram bot started successfully (webhook mode).")
+            return
+        except Exception:
+            logger.exception("Could not configure Telegram webhook")
+            raise
 
-        if SHUTDOWN_EVENT.is_set():
-            break
-
-        # Do NOT os.execv() here. Self-exec can create a new HTTP listener,
-        # leave threads behind, or make Render lose the port during restart.
-        delay = min(backoff, 300)
-        logger.info("Polling retry in %ss", delay)
-        SHUTDOWN_EVENT.wait(delay)
-        backoff = min(backoff * 2, 300)
-
-        # Successful polling resets the backoff when the loop remains healthy.
-        if consecutive_failures == 0:
-            backoff = 5
+    # Local/non-Render fallback. This branch is intentionally never used on
+    # a normal Render Web Service because RENDER_EXTERNAL_URL is provided.
+    logger.info("No public webhook URL found; starting local polling mode.")
+    bot.remove_webhook()
+    bot.infinity_polling(
+        timeout=60,
+        long_polling_timeout=30,
+        skip_pending=True,
+        allowed_updates=None,
+    )
 
 
 def cleanup():
-    """Stop child scripts, HTTP server and background workers cleanly."""
+    """Stop child scripts, webhook and HTTP server cleanly."""
+    global HEALTH_SERVER
     if SHUTDOWN_EVENT.is_set():
-        # Cleanup is intentionally idempotent.
-        pass
-    SHUTDOWN_EVENT.set()
+        return
 
+    SHUTDOWN_EVENT.set()
     logger.warning("Shutting down — killing all child scripts...")
+
     for key, info in list(bot_scripts.items()):
         try:
             kill_process_tree(info)
@@ -3863,7 +3912,13 @@ def cleanup():
             logger.exception("Failed cleaning child process %s", key)
     bot_scripts.clear()
 
-    global HEALTH_SERVER
+    if WEBHOOK_MODE:
+        try:
+            bot.remove_webhook()
+            logger.info("Telegram webhook removed.")
+        except Exception:
+            logger.exception("Failed to remove Telegram webhook")
+
     if HEALTH_SERVER is not None:
         try:
             HEALTH_SERVER.server_close()
@@ -3900,42 +3955,42 @@ def main():
     """Render-safe process entry point."""
     global POLLING_THREAD
 
-    # Bind the HTTP port FIRST. If binding fails, Render gets a clear fatal
-    # error instead of silently reporting 'No open ports detected'.
-    start_health_thread = threading.Thread(
+    # 1) Start and verify the HTTP listener first.
+    health_thread = threading.Thread(
         target=start_health_server,
-        name="render-health-server",
+        name="render-http-server",
         daemon=False,
     )
-    start_health_thread.start()
+    health_thread.start()
 
-    # Wait briefly for the server to bind before starting Telegram polling.
-    # This removes the startup race that can cause Render port detection to
-    # miss the listener on cold starts.
     deadline = time.monotonic() + 15
-    while HEALTH_SERVER is None and start_health_thread.is_alive() and time.monotonic() < deadline:
-        time.sleep(0.1)
+    while HEALTH_SERVER is None and health_thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
     if HEALTH_SERVER is None:
-        raise RuntimeError("Render HTTP health server did not start within 15 seconds")
+        raise RuntimeError("Render HTTP server did not bind within 15 seconds")
 
-    POLLING_THREAD = threading.Thread(
-        target=polling_worker,
-        name="telegram-polling",
-        daemon=True,
-    )
-    POLLING_THREAD.start()
+    logger.info("Render Web Service HTTP port is ready.")
+
+    # 2) Configure Telegram only after Render's port is ready.
+    try:
+        start_telegram()
+    except Exception:
+        cleanup()
+        if health_thread.is_alive():
+            health_thread.join(timeout=3)
+        raise
+
     logger.info("Render Web Service startup complete.")
 
-    # Keep the main process alive while the health server is serving.
     try:
         while not SHUTDOWN_EVENT.wait(5):
-            if not start_health_thread.is_alive():
-                raise RuntimeError("Render HTTP health server stopped unexpectedly")
+            if not health_thread.is_alive():
+                raise RuntimeError("Render HTTP server stopped unexpectedly")
     finally:
         cleanup()
-        if start_health_thread.is_alive():
-            start_health_thread.join(timeout=3)
+        if health_thread.is_alive():
+            health_thread.join(timeout=3)
 
 
 if __name__ == "__main__":
