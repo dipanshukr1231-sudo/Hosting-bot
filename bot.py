@@ -3762,5 +3762,26 @@ def run_bot():
             consecutive_failures = 0
             backoff = 5
 
+
+# Render Web Service health endpoint
+def start_health_server():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK - Telegram bot is running")
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+        def log_message(self, format, *args):
+            pass
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health server listening on 0.0.0.0:{port}")
+    server.serve_forever()
+
 if __name__ == "__main__":
+    threading.Thread(target=start_health_server, daemon=True).start()
     run_bot()
