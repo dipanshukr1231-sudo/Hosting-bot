@@ -69,10 +69,10 @@ def _require_env(name, fallback=""):
     val = os.environ.get(name, "").strip()
     return val if val else fallback
 
-TOKEN          = _require_env("BOT_TOKEN",           "8862790975:AAGsdvMQnAl_WLuB0Hz8IFhf_XiUja_pkU8")
-OWNER_ID       = int(_require_env("OWNER_ID",        "8455806295"))
-ADMIN_ID       = int(_require_env("ADMIN_ID",        "8455806295"))
-YOUR_USERNAME  = _require_env("YOUR_USERNAME",       "@nox_shadowx")
+TOKEN          = _require_env("BOT_TOKEN",           "")
+OWNER_ID       = int(_require_env("OWNER_ID",        "8753914631"))
+ADMIN_ID       = int(_require_env("ADMIN_ID",        "8753914631"))
+YOUR_USERNAME  = _require_env("YOUR_USERNAME",       "@OfficialDkSharma01")
 SAMBA_API_KEY  = _require_env("SAMBA_API_KEY",       "e4502644-72e1-41bb-96df-e13aa741a6f9")
 
 REQUIRED_CHANNELS = ["@BrokenXworld"]
