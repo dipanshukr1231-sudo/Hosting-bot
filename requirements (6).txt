@@ -1,0 +1,27 @@
+# ============================================================
+# HACKER_XD01 Hosting Bot — V6 requirements.txt
+# ============================================================
+# Core Telegram bot framework
+pyTelegramBotAPI>=4.14.0
+
+# System / process monitoring (auto-recovery, resource caps, watchdog)
+psutil>=5.9.5
+
+# HTTP client (SambaNova AI, GitHub API, downloads)
+requests>=2.31.0
+urllib3>=2.0.0
+
+# .env loading for hosting-bot secrets (TOKEN, OWNER_ID, SAMBA_API_KEY, VAULT_KEY)
+python-dotenv>=1.0.0
+
+# Secrets / Variables Vault — Fernet encryption for user_variables table
+cryptography>=42.0.0
+
+# Optional: external Postgres backend for metadata persistence
+# (uncomment if you switch DATABASE_PATH / use SQLAlchemy backend)
+# SQLAlchemy>=2.0.0
+# psycopg2-binary>=2.9.9
+
+# Optional: S3-compatible object storage for uploaded-script backups
+# (Cloudflare R2 / Backblaze B2 free tier — Section 4 item 54)
+# boto3>=1.34.0
